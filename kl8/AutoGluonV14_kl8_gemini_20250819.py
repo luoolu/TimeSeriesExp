@@ -23,6 +23,7 @@ import gc
 import logging
 import warnings
 import pickle
+import json
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Union, Any
@@ -45,6 +46,57 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
 from autogluon.timeseries import TimeSeriesPredictor, TimeSeriesDataFrame
 from autogluon.common import space
+
+# === Begin: Safe JSON Encoder for numpy/pandas types ===
+import json as _json_alias
+try:
+    import numpy as _np_alias
+except Exception:  # pragma: no cover
+    _np_alias = None
+try:
+    import pandas as _pd_alias
+except Exception:  # pragma: no cover
+    _pd_alias = None
+try:
+    import datetime as _dt_alias
+except Exception:  # pragma: no cover
+    _dt_alias = None
+
+class SafeNpEncoder(_json_alias.JSONEncoder):
+    def default(self, o):
+        # numpy scalar types
+        if _np_alias is not None:
+            if isinstance(o, (_np_alias.integer,)):
+                return int(o)
+            if isinstance(o, (_np_alias.floating,)):
+                return float(o)
+            if isinstance(o, (_np_alias.bool_,)):
+                return bool(o)
+            if isinstance(o, (_np_alias.ndarray,)):
+                return o.tolist()
+        # pandas types
+        if _pd_alias is not None:
+            if isinstance(o, (_pd_alias.Series, _pd_alias.Index)):
+                return o.tolist()
+            if isinstance(o, (_pd_alias.Timestamp, _pd_alias.Timedelta, _pd_alias.Period)):
+                return o.isoformat()
+        # datetime objects
+        if _dt_alias is not None:
+            if isinstance(o, (_dt_alias.datetime, _dt_alias.date, _dt_alias.time)):
+                return o.isoformat()
+        return super().default(o)
+
+def json_dump_safe(obj, fp, **kwargs):
+    # If user already passed a custom encoder, respect it; otherwise use SafeNpEncoder
+    if "cls" not in kwargs:
+        kwargs["cls"] = SafeNpEncoder
+    return _json_alias.dump(obj, fp, **kwargs)
+
+def json_dumps_safe(obj, **kwargs):
+    if "cls" not in kwargs:
+        kwargs["cls"] = SafeNpEncoder
+    return _json_alias.dumps(obj, **kwargs)
+# === End: Safe JSON Encoder for numpy/pandas types ===
 
 # ===== 配置类定义 =============================================================
 
@@ -364,23 +416,28 @@ class AdvancedFeatureEngineer:
         num_cols = [f'开奖号_{i}' for i in range(1, 21)]
         if not all(col in df.columns for col in num_cols):
             return df
-            
-        # 数字频率统计
+
+        logger.info("Calculating frequency features efficiently...")
+        # Create a boolean DataFrame indicating where each number appears
+        all_numbers_present = pd.concat([df[col] for col in num_cols]).unique()
+        all_numbers_present.sort()
+
+        # Use a more efficient approach for frequency calculation
         for window in [10, 30, 50, 100]:
+            # Create a single multi-index dataframe for the window's counts
+            # This is much faster than iterating over every number
+            rolling_counts = df[num_cols].rolling(window=window, min_periods=1)
+            
+            # We can't apply value_counts directly on the rolling object.
+            # Instead, we iterate over numbers, but use efficient rolling sum.
             for num in range(1, 81):
-                freq_col = f'freq_{num}_{window}'
-                df[freq_col] = 0
-                
-                for i in range(len(df)):
-                    start_idx = max(0, i - window)
-                    subset = df.iloc[start_idx:i]
-                    if not subset.empty:
-                        freq = 0
-                        for col in num_cols:
-                            if col in subset.columns:
-                                freq += (subset[col] == num).sum()
-                        df.iloc[i, df.columns.get_loc(freq_col)] = freq
-                        
+                # Check where the number appears across all 20 columns
+                is_num_present = df[num_cols].eq(num).sum(axis=1)
+                # Calculate rolling sum of occurrences, shift to not include current row
+                freq = is_num_present.rolling(window=window, min_periods=1).sum().shift(1).fillna(0)
+                df[f'freq_{num}_{window}'] = freq
+
+        logger.info("Frequency features calculation complete.")
         return df
         
     def _extract_anomaly_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -625,7 +682,65 @@ class AdvancedPredictor:
 
         return results
 
-    def _compute_qra_ensemble(self, predictions: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    
+    def _make_known_covariates_future(self, data_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+        """
+        构造未来 horizon 天（按日频率）的已知协变量（known covariates）。
+        在训练开启 known_covariates_names 的前提下，预测时基于历史最后一天向后扩展。
+        返回列：['item_id','timestamp'] + self.known_covariates_names（存在者）。
+        """
+        if not getattr(self, "known_covariates_names", []):
+            return pd.DataFrame(columns=["item_id", "timestamp"])
+
+        if "item_id" not in data_df.columns or "timestamp" not in data_df.columns:
+            raise ValueError("data_df 必须包含 'item_id' 与 'timestamp' 列")
+
+        data_df = data_df.copy()
+        data_df["timestamp"] = pd.to_datetime(data_df["timestamp"])
+
+        last_ts_map = data_df.groupby("item_id")["timestamp"].max().to_dict()
+        all_rows = []
+
+        def _calendar_features(ts: pd.Series) -> pd.DataFrame:
+            df = pd.DataFrame({"timestamp": ts})
+            df["day_of_week"] = df["timestamp"].dt.dayofweek
+            df["week_of_year"] = df["timestamp"].dt.isocalendar().week.astype(int)
+            df["month"] = df["timestamp"].dt.month
+            df["quarter"] = df["timestamp"].dt.quarter
+            df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+            df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7.0)
+            df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7.0)
+            df["week_of_year_sin"] = np.sin(2 * np.pi * df["week_of_year"] / 52.0)
+            df["week_of_year_cos"] = np.cos(2 * np.pi * df["week_of_year"] / 52.0)
+            df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12.0)
+            df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12.0)
+            return df
+
+        for item_id, last_ts in last_ts_map.items():
+            future_index = pd.date_range(start=last_ts + pd.Timedelta(days=1), periods=horizon, freq="D")
+            if len(future_index) == 0:
+                continue
+            feat = _calendar_features(pd.Series(future_index))
+            feat.insert(0, "item_id", item_id)
+            all_rows.append(feat)
+
+        if not all_rows:
+            return pd.DataFrame(columns=["item_id", "timestamp"] + list(self.known_covariates_names))
+
+        future_df = pd.concat(all_rows, ignore_index=True)
+        keep_covs = [c for c in self.known_covariates_names if c in future_df.columns]
+        future_df = future_df[["item_id", "timestamp"] + keep_covs].sort_values(["item_id", "timestamp"]).reset_index(drop=True)
+
+        try:
+            if "category" in str(data_df["item_id"].dtype):
+                future_df["item_id"] = future_df["item_id"].astype(data_df["item_id"].dtype)
+        except Exception:
+            pass
+
+        return future_df
+
+
+def _compute_qra_ensemble(self, predictions: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """计算QRA集成预测"""
         try:
             reference_df = next(iter(predictions.values()))
@@ -654,41 +769,6 @@ class AdvancedPredictor:
             return reference_df
 
 # ===== 高级遗传算法优化器 ======================================================
-    def _make_known_covariates_future(self, data_df, horizon: int):
-        """
-        Construct future known_covariates (calendar features) for each item_id.
-        Expects columns: ['item_id','timestamp'] present in data_df.
-        """
-        try:
-            names = getattr(self, "known_covariates_names", []) or []
-            if not names:
-                return None
-            import pandas as pd, math
-            items = data_df['item_id'].unique()
-            last_ts = data_df.groupby('item_id')['timestamp'].max()
-            frames = []
-            for item in items:
-                start = last_ts.loc[item] + pd.Timedelta(days=1)
-                idx = pd.date_range(start=start, periods=horizon, freq='D')
-                tmp = pd.DataFrame({'item_id': item, 'timestamp': idx})
-                # temporal calendar features
-                ts = tmp['timestamp']
-                tmp['day_of_week'] = ts.dt.weekday
-                tmp['week_of_year'] = ts.dt.isocalendar().week.astype(int)
-                tmp['month'] = ts.dt.month
-                tmp['quarter'] = ts.dt.quarter
-                tmp['day_of_week_sin'] = (2*math.pi*tmp['day_of_week']/7).apply(math.sin)
-                tmp['day_of_week_cos'] = (2*math.pi*tmp['day_of_week']/7).apply(math.cos)
-                tmp['week_of_year_sin'] = (2*math.pi*tmp['week_of_year']/52).apply(math.sin)
-                tmp['week_of_year_cos'] = (2*math.pi*tmp['week_of_year']/52).apply(math.cos)
-                tmp['month_sin'] = (2*math.pi*tmp['month']/12).apply(math.sin)
-                tmp['month_cos'] = (2*math.pi*tmp['month']/12).apply(math.cos)
-                tmp['is_weekend'] = tmp['day_of_week'].isin([5,6]).astype(int)
-                cols = ['item_id', 'timestamp'] + [c for c in names if c in tmp.columns]
-                frames.append(tmp[cols])
-            return pd.concat(frames, ignore_index=True) if frames else None
-        except Exception:
-            return None
 
 class MultiObjectiveGeneticOptimizer:
     """多目标遗传算法优化器"""
@@ -1729,70 +1809,18 @@ class ResultExporter:
         
         # JSON格式（包含更多信息）
         json_file = os.path.join(self.results_dir, f'prediction_details_{date_str}.json')
-        import json
+        
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json_dump_safe({
+                    'date': date_str,
+                    'final_numbers': final_numbers,
+                    'confidence_score': confidence,
+                    'uncertainty_metrics': prediction_result['uncertainty_metrics'],
+                    'candidate_pool_size': len(prediction_result['candidate_pool']),
+                    'prediction_source': prediction_result['prediction_source']
+                }, f, ensure_ascii=False, indent=2)
 
-# === Begin: Safe JSON Encoder for numpy/pandas types ===
-import json as _json_alias
-try:
-    import numpy as _np_alias
-except Exception:  # pragma: no cover
-    _np_alias = None
-try:
-    import pandas as _pd_alias
-except Exception:  # pragma: no cover
-    _pd_alias = None
-try:
-    import datetime as _dt_alias
-except Exception:  # pragma: no cover
-    _dt_alias = None
-
-class SafeNpEncoder(_json_alias.JSONEncoder):
-    def default(self, o):
-        # numpy scalar types
-        if _np_alias is not None:
-            if isinstance(o, (_np_alias.integer,)):
-                return int(o)
-            if isinstance(o, (_np_alias.floating,)):
-                return float(o)
-            if isinstance(o, (_np_alias.bool_,)):
-                return bool(o)
-            if isinstance(o, (_np_alias.ndarray,)):
-                return o.tolist()
-        # pandas types
-        if _pd_alias is not None:
-            if isinstance(o, (_pd_alias.Series, _pd_alias.Index)):
-                return o.tolist()
-            if isinstance(o, (_pd_alias.Timestamp, _pd_alias.Timedelta, _pd_alias.Period)):
-                return o.isoformat()
-        # datetime objects
-        if _dt_alias is not None:
-            if isinstance(o, (_dt_alias.datetime, _dt_alias.date, _dt_alias.time)):
-                return o.isoformat()
-        return super().default(o)
-
-def json_dump_safe(obj, fp, **kwargs):
-    # If user already passed a custom encoder, respect it; otherwise use SafeNpEncoder
-    if "cls" not in kwargs:
-        kwargs["cls"] = SafeNpEncoder
-    return _json_alias.dump(obj, fp, **kwargs)
-
-def json_dumps_safe(obj, **kwargs):
-    if "cls" not in kwargs:
-        kwargs["cls"] = SafeNpEncoder
-    return _json_alias.dumps(obj, **kwargs)
-# === End: Safe JSON Encoder for numpy/pandas types ===
-
-    with open(json_file, 'w', encoding='utf-8') as f:
-        json_dump_safe({
-                'date': date_str,
-                'final_numbers': final_numbers,
-                'confidence_score': confidence,
-                'uncertainty_metrics': prediction_result['uncertainty_metrics'],
-                'candidate_pool_size': len(prediction_result['candidate_pool']),
-                'prediction_source': prediction_result['prediction_source']
-            }, f, ensure_ascii=False, indent=2)
-            
-def _export_analysis_report(self, prediction_result: Dict[str, Any],
+    def _export_analysis_report(self, prediction_result: Dict[str, Any],
                               historical_patterns: Dict[str, Any], date_str: str):
         """导出详细分析报告"""
         report_file = os.path.join(self.results_dir, f'analysis_report_{date_str}.md')
@@ -1970,6 +1998,8 @@ class KL8PredictionSystem:
             logger.info("🎉 KL-8预测系统运行成功!")
             return summary
             
+        except FileNotFoundError:
+            logger.critical(f"数据文件未找到: {DATA_PATH}. 请检查路径配置。")
         except Exception as e:
             logger.critical(f"预测管道执行失败: {e}", exc_info=True)
             return {
